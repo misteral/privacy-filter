@@ -17,6 +17,11 @@ dependencies = [
   "tiktoken",
 ]
 
+[project.optional-dependencies]
+mlx = [
+  "mlx",
+]
+
 [project.scripts]
 opf = "opf.__main__:main"
 
