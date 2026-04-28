@@ -21,6 +21,9 @@ dependencies = [
 mlx = [
   "mlx",
 ]
+benchmark = [
+  "datasets",
+]
 
 [project.scripts]
 opf = "opf.__main__:main"
