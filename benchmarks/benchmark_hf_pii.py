@@ -9,12 +9,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import resource
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
+
+
+def _peak_memory_mb() -> float:
+    """Peak resident-set size of the current process in MB.
+
+    `ru_maxrss` is bytes on macOS but kilobytes on Linux/BSD — normalize to MB.
+    """
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return rss / (1024 * 1024)
+    return rss / 1024
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -96,6 +109,7 @@ class BackendMetrics:
     exact_tp: int
     any_tp: int
     warmup_examples: int = 0
+    peak_memory_mb: float | None = None
     error: str | None = None
     per_example: list[dict[str, Any]] = field(default_factory=list)
 
@@ -144,6 +158,7 @@ class BackendMetrics:
             "examples_per_sec": examples_per_sec,
             "chars_per_sec": chars_per_sec,
             "tokens_per_sec": tokens_per_sec,
+            "peak_memory_mb": self.peak_memory_mb,
             "error": self.error,
         }
 
@@ -286,6 +301,238 @@ def _build_mlx_backend(args: argparse.Namespace) -> Any:
     )
 
 
+@dataclass
+class _SwiftDaemonSpan:
+    label: str
+    start: int
+    end: int
+
+
+@dataclass
+class _SwiftDaemonResult:
+    detected_spans: list[_SwiftDaemonSpan]
+
+
+class SwiftDaemonBackend:
+    """Benchmark adapter that talks to the Swift opf-mlx-daemon over a Unix socket.
+
+    The daemon owns the model and returns argmax token labels for a batch=1
+    window of pre-tokenized o200k_base ids. This adapter handles tokenization,
+    windowing, label-to-span conversion, and span trimming using the existing
+    OPF helpers — so the result shape matches what the benchmark expects from
+    the original/mlx backends (an object with ``detected_spans``).
+    """
+
+    def __init__(
+        self,
+        *,
+        checkpoint: str | None,
+        n_ctx: int,
+        socket_path: str,
+    ) -> None:
+        # Imports are deferred so that benchmark startup doesn't require these
+        # packages until the swift-mlx-daemon backend is actually selected.
+        import tiktoken
+        from opf._common.checkpoint_download import ensure_default_checkpoint
+        from opf._common.label_space import resolve_label_space_from_config
+        from opf._core.sequence_labeling import build_label_info
+
+        if checkpoint is None:
+            checkpoint_path = Path(ensure_default_checkpoint())
+        else:
+            checkpoint_path = Path(checkpoint).expanduser()
+        config_path = checkpoint_path / "config.json"
+        with config_path.open("r", encoding="utf-8") as handle:
+            self.config_json = json.load(handle)
+
+        self.checkpoint = str(checkpoint_path)
+        self.n_ctx = int(n_ctx)
+        if self.n_ctx <= 0:
+            raise ValueError("context_window_length must be positive")
+
+        encoding_name = str(self.config_json.get("encoding", "o200k_base"))
+        self.encoding = tiktoken.get_encoding(encoding_name)
+
+        _category_version, _span_names, ner_names = resolve_label_space_from_config(
+            self.config_json, context=str(config_path)
+        )
+        self.label_info = build_label_info(ner_names)
+
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.connect(socket_path)
+        self._recv_buf = bytearray()
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _send_request(self, tokens: Sequence[int]) -> list[int]:
+        payload = json.dumps({"tokens": list(tokens)}).encode("utf-8")
+        self._sock.sendall(payload + b"\n")
+        line = self._read_line()
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"daemon returned invalid JSON: {line!r}") from exc
+        if "error" in response:
+            raise RuntimeError(f"daemon error: {response['error']}")
+        labels = response.get("labels")
+        if not isinstance(labels, list):
+            raise RuntimeError(f"daemon response missing labels: {response!r}")
+        if len(labels) != len(tokens):
+            raise RuntimeError(
+                f"daemon returned {len(labels)} labels for window of {len(tokens)} tokens"
+            )
+        return [int(v) for v in labels]
+
+    def _read_line(self) -> bytes:
+        while True:
+            idx = self._recv_buf.find(b"\n")
+            if idx >= 0:
+                line = bytes(self._recv_buf[:idx])
+                del self._recv_buf[: idx + 1]
+                return line
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("daemon closed connection")
+            self._recv_buf.extend(chunk)
+
+    def redact(self, text: str) -> _SwiftDaemonResult:
+        from opf._core.sequence_labeling import TokenizedExample, example_to_windows
+        from opf._core.spans import (
+            decode_text_with_offsets,
+            labels_to_spans,
+            token_spans_to_char_spans,
+            trim_char_spans_whitespace,
+        )
+
+        token_ids = tuple(int(tok) for tok in self.encoding.encode(text, allowed_special="all"))
+        if not token_ids:
+            return _SwiftDaemonResult(detected_spans=[])
+
+        background = int(self.label_info.background_token_label)
+        example = TokenizedExample(
+            tokens=token_ids,
+            labels=tuple(background for _ in token_ids),
+            example_id="swift-mlx-example",
+            text=text,
+        )
+
+        labels_by_index: dict[int, int] = {}
+        for window in example_to_windows(example, self.n_ctx):
+            if not window.tokens:
+                continue
+            window_labels = self._send_request(window.tokens)
+            for token_pos, is_valid in enumerate(window.mask):
+                if not bool(is_valid):
+                    continue
+                labels_by_index[int(window.offsets[token_pos])] = int(window_labels[token_pos])
+
+        if not labels_by_index:
+            return _SwiftDaemonResult(detected_spans=[])
+
+        token_spans = labels_to_spans(labels_by_index, self.label_info)
+        decoded_text, char_starts, char_ends = decode_text_with_offsets(token_ids, self.encoding)
+        source_text = decoded_text if decoded_text != text else text
+        char_spans = token_spans_to_char_spans(token_spans, char_starts, char_ends)
+        char_spans = trim_char_spans_whitespace(char_spans, source_text)
+
+        detected: list[_SwiftDaemonSpan] = []
+        for label_idx, start, end in char_spans:
+            if not (0 <= start < end <= len(source_text)):
+                continue
+            label = str(self.label_info.span_class_names[int(label_idx)])
+            detected.append(_SwiftDaemonSpan(label=label, start=int(start), end=int(end)))
+        return _SwiftDaemonResult(detected_spans=_select_non_overlapping(detected))
+
+
+def _select_non_overlapping(spans: Sequence[_SwiftDaemonSpan]) -> list[_SwiftDaemonSpan]:
+    ordered = sorted(spans, key=lambda s: (s.start, -(s.end - s.start), s.label))
+    kept: list[_SwiftDaemonSpan] = []
+    cursor = 0
+    for span in ordered:
+        if span.start < cursor or span.end <= span.start:
+            continue
+        kept.append(span)
+        cursor = span.end
+    return kept
+
+
+def _build_swift_daemon_backend(args: argparse.Namespace) -> Any:
+    return SwiftDaemonBackend(
+        checkpoint=args.checkpoint,
+        n_ctx=args.context,
+        socket_path=args.swift_socket,
+    )
+
+
+class SwiftTextDaemonBackend:
+    """Benchmark adapter that talks to the full Swift text daemon over a Unix socket.
+
+    Unlike `SwiftDaemonBackend`, this backend sends raw text and trusts the Swift
+    daemon to tokenize, run the model, decode (argmax/Viterbi), and return the
+    final character-level detected spans. The daemon's startup `--decode-mode`
+    sets the default; per-request `decode_mode` overrides it.
+    """
+
+    def __init__(self, *, socket_path: str, decode_mode: str | None) -> None:
+        self.socket_path = socket_path
+        self.decode_mode = decode_mode
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.connect(socket_path)
+        self._recv_buf = bytearray()
+
+    def close(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+    def _read_line(self) -> bytes:
+        while True:
+            idx = self._recv_buf.find(b"\n")
+            if idx >= 0:
+                line = bytes(self._recv_buf[:idx])
+                del self._recv_buf[: idx + 1]
+                return line
+            chunk = self._sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("daemon closed connection")
+            self._recv_buf.extend(chunk)
+
+    def redact(self, text: str) -> _SwiftDaemonResult:
+        payload: dict[str, Any] = {"text": text}
+        if self.decode_mode is not None:
+            payload["decode_mode"] = self.decode_mode
+        self._sock.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+        line = self._read_line()
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"daemon returned invalid JSON: {line!r}") from exc
+        if "error" in response:
+            raise RuntimeError(f"daemon error: {response['error']}")
+        spans_raw = response.get("detected_spans", [])
+        spans: list[_SwiftDaemonSpan] = []
+        for entry in spans_raw:
+            label = entry.get("label")
+            start = entry.get("start")
+            end = entry.get("end")
+            if not isinstance(label, str) or start is None or end is None:
+                continue
+            spans.append(_SwiftDaemonSpan(label=label, start=int(start), end=int(end)))
+        return _SwiftDaemonResult(detected_spans=spans)
+
+
+def _build_swift_text_daemon_backend(args: argparse.Namespace) -> Any:
+    return SwiftTextDaemonBackend(
+        socket_path=args.swift_text_socket,
+        decode_mode=args.decode_mode,
+    )
+
+
 def _spans_from_result(result: Any) -> list[tuple[str, int, int]]:
     detected = getattr(result, "detected_spans", None)
     if detected is None:
@@ -421,6 +668,7 @@ def _run_backend(
         exact_tp=exact_tp,
         any_tp=any_tp,
         warmup_examples=effective_warmup,
+        peak_memory_mb=_peak_memory_mb(),
         per_example=per_example,
     )
 
@@ -455,6 +703,7 @@ def _print_backend_section(metrics: BackendMetrics) -> None:
     print(f"  examples/sec:      {_format_optional_float(derived['examples_per_sec'], '.3f')}")
     print(f"  chars/sec:         {_format_optional_float(derived['chars_per_sec'], '.1f')}")
     print(f"  tokens/sec:        {_format_optional_float(derived['tokens_per_sec'], '.1f')}")
+    print(f"  peak_memory_mb:    {_format_optional_float(derived['peak_memory_mb'], '.1f')}")
 
 
 def _safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
@@ -525,8 +774,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("original", "mlx", "both"),
+        choices=("original", "mlx", "swift-mlx-daemon", "swift-mlx-text-daemon", "both"),
         default="both",
+        help=(
+            "Backend to benchmark. 'both' runs original+mlx; the swift-mlx-daemon "
+            "and swift-mlx-text-daemon backends each require a separately-started "
+            "Swift daemon process."
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -545,11 +799,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--moe-chunk-size", type=int, default=2)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument(
+        "--swift-socket",
+        type=str,
+        default="/tmp/opf-mlx-swift.sock",
+        help="Unix socket path for the swift-mlx-daemon (token) backend.",
+    )
+    parser.add_argument(
+        "--swift-text-socket",
+        type=str,
+        default="/tmp/opf-mlx-swift-text.sock",
+        help="Unix socket path for the swift-mlx-text-daemon backend.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+
+    if args.backend == "swift-mlx-daemon" and args.decode_mode != "argmax":
+        print(
+            "error: --backend swift-mlx-daemon requires --decode-mode argmax "
+            "(the token-only Swift daemon does not run Viterbi). Use the "
+            "--backend swift-mlx-text-daemon backend for Viterbi.",
+            file=sys.stderr,
+        )
+        return 2
 
     encoder = _try_get_tokenizer()
     examples = _load_examples(
@@ -571,6 +846,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         backends_to_run.append(("original", lambda: _build_original_backend(args)))
     if args.backend in ("mlx", "both"):
         backends_to_run.append(("mlx", lambda: _build_mlx_backend(args)))
+    if args.backend == "swift-mlx-daemon":
+        backends_to_run.append(
+            ("swift-mlx-daemon", lambda: _build_swift_daemon_backend(args))
+        )
+    if args.backend == "swift-mlx-text-daemon":
+        backends_to_run.append(
+            ("swift-mlx-text-daemon", lambda: _build_swift_text_daemon_backend(args))
+        )
 
     results: dict[str, BackendMetrics] = {}
     for name, builder in backends_to_run:
@@ -581,7 +864,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             warmup=args.warmup,
         )
 
-    for name in ("original", "mlx"):
+    for name in ("original", "mlx", "swift-mlx-daemon", "swift-mlx-text-daemon"):
         if name in results:
             _print_backend_section(results[name])
 
